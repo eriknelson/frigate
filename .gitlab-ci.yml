@@ -1,0 +1,99 @@
+workflow:
+  rules:
+    - if: $RELEASE == "true" && $CI_COMMIT_BRANCH == "nsk"
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages: [prepare, validate, build, release]
+
+variables:
+  NODE_IMAGE: harbor.secnet.nsk.io/dockerhub/library/node:24.22.1-bookworm-slim
+  HARBOR_REGISTRY: harbor.secnet.nsk.io
+  HARBOR_PROJECT: frigate
+  HARBOR_REPOSITORY: frigate
+  HARBOR_IMAGE: ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${HARBOR_REPOSITORY}
+  BUILDKIT_ADDR: tcp://titan-buildkitd.secnet.nsk.io:1234
+
+default:
+  tags: [titan-docker]
+
+validate:
+  stage: validate
+  image: $NODE_IMAGE
+  script:
+    - cd web
+    - npm ci --no-audit --no-fund
+    - npm run e2e:build
+    - npx --no-install playwright install --with-deps chromium
+    - >-
+      npx --no-install playwright test --config e2e/playwright.config.ts
+      e2e/specs/local-webrtc.spec.ts e2e/specs/live.spec.ts
+      --workers 1 --reporter line
+
+.release-tools:
+  image: $NODE_IMAGE
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 0
+  rules:
+    - if: $RELEASE == "true" && $CI_COMMIT_BRANCH == "nsk"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git ca-certificates
+    - npm init -y >/dev/null
+    - >-
+      npm install --save-dev semantic-release@24 @semantic-release/commit-analyzer
+      @semantic-release/release-notes-generator @semantic-release/changelog
+      @semantic-release/git @semantic-release/gitlab
+      conventional-changelog-conventionalcommits@10.3.0
+
+determine-version:
+  extends: .release-tools
+  stage: prepare
+  script:
+    - |
+      set +e
+      SR_OUTPUT=$(npx --no-install semantic-release --dry-run --no-ci 2>&1)
+      SR_EXIT=$?
+      set -e
+      printf '%s\n' "$SR_OUTPUT"
+      [ "$SR_EXIT" -eq 0 ] || exit "$SR_EXIT"
+      VERSION=$(printf '%s\n' "$SR_OUTPUT" | sed -n \
+        's/.*[Tt]he next release version is \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' | head -1)
+      [ -n "$VERSION" ] || { echo 'No release-worthy changes'; exit 1; }
+      printf 'VERSION=%s\n' "$VERSION" > version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+
+build:image:
+  stage: build
+  image: harbor.secnet.nsk.io/dockerhub/library/docker:27.5.1-cli
+  needs:
+    - job: validate
+    - job: determine-version
+      optional: true
+  script:
+    - >-
+      docker buildx create --name "frigate-${CI_PIPELINE_ID}"
+      --driver remote "$BUILDKIT_ADDR"
+    - |
+      if [ "${RELEASE:-}" = true ]; then
+        [ -n "${VERSION:-}" ] || exit 1
+        printf '%s\n' "$HARBOR_PASS" | docker login "$HARBOR_REGISTRY" \
+          --username "$HARBOR_USER" --password-stdin
+        docker buildx build --builder "frigate-${CI_PIPELINE_ID}" \
+          -f nsk/Dockerfile --push --tag "${HARBOR_IMAGE}:${VERSION}" .
+      else
+        docker buildx build --builder "frigate-${CI_PIPELINE_ID}" \
+          -f nsk/Dockerfile --tag "${HARBOR_IMAGE}:${CI_COMMIT_SHORT_SHA}" .
+      fi
+  after_script:
+    - docker buildx rm "frigate-${CI_PIPELINE_ID}"
+
+semantic-release:
+  extends: .release-tools
+  stage: release
+  needs: [determine-version, validate, 'build:image']
+  script:
+    - npx --no-install semantic-release

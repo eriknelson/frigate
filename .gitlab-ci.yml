@@ -9,6 +9,7 @@ stages: [prepare, validate, build, release]
 
 variables:
   NODE_IMAGE: harbor.secnet.nsk.io/dockerhub/library/node:24.22.1-bookworm-slim
+  NODE_OPTIONS: --max-old-space-size=3072
   HARBOR_REGISTRY: harbor.secnet.nsk.io
   HARBOR_PROJECT: frigate
   HARBOR_REPOSITORY: frigate
